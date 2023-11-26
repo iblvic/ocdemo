@@ -17,27 +17,30 @@
 #include "hookmsg.h"
 #include <sys/mman.h>
 #include <os/lock.h>
+#include "backtraceManager.h"
+#include <sys/stat.h>
+#include <sys/errno.h>
 
-#define MAP_SIZE 4096
+#define BUFFER_SIZE 1024
 
 __unused static id (*xx_orig_objc_msgSend)(id, SEL, ...);
 static void xx_hook_objc_msgSend(id self, SEL _cmd);
-static void handleBacktrace(int idx);
-static int* fds = NULL;
-static int *mapped_sizes = NULL;
-static void **map_areas = NULL;
-static size_t *writed_sizes = NULL;
-static int threadNum = 1;
-static void **backtrace_pointers = NULL;
-static void **current_backtrace_p = NULL;
-static void **handle_current_backtrace_p = NULL;
-static int *backtrace_sizes = NULL;
-static int *handle_backtrace_sizes = NULL;
-static int *backtrace_left_sizes = NULL;
-static size_t method_count = 0;
+static void handleBacktrace(void);
 static os_unfair_lock globalLock = OS_UNFAIR_LOCK_INIT;
-//static dispatch_semaphore_t *handler_semaphores = NULL;
 static bool stop_handle = false;
+static int MAP_SIZE = 4096;
+
+
+typedef struct _msg_handler {
+    backtrace_m *bt_m;
+    int mapped_size;
+    void *map_area;
+    int fd;
+    size_t writed_size;
+} msg_handler;
+
+static msg_handler msgHandler = {0};
+
 
 void xx_dtp_hook_begin(void) {
     static dispatch_once_t onceToken;
@@ -51,39 +54,17 @@ void xx_dtp_hook_begin(void) {
 //}
 
 __attribute__((constructor)) static void xx_hook_entry(void) {
-    backtrace_pointers = calloc(threadNum, sizeof(void*));
-    current_backtrace_p = calloc(threadNum, sizeof(void*));
-    handle_current_backtrace_p = calloc(threadNum, sizeof(void*));
-    backtrace_sizes = calloc(threadNum, sizeof(int));
-    handle_backtrace_sizes = calloc(threadNum, sizeof(int));
-    backtrace_left_sizes = calloc(threadNum, sizeof(int));
-    fds = calloc(threadNum, sizeof(int));
-    mapped_sizes = calloc(threadNum, sizeof(int));
-    map_areas = calloc(threadNum, sizeof(void*));
-    writed_sizes = calloc(threadNum, sizeof(size_t));
-//    handler_semaphores = calloc(threadNum, sizeof(dispatch_semaphore_t));
-    for (int i = 0; i < threadNum; i++) {
-        backtrace_pointers[i] = NULL;
-        current_backtrace_p[i] = NULL;
-        handle_current_backtrace_p[i] = NULL;
-        backtrace_sizes[i] = 0;
-        handle_backtrace_sizes[i] = 0;
-        backtrace_left_sizes[i] = 0;
-        fds[i] = -1;
-        mapped_sizes[i] = 0;
-        map_areas[i] = NULL;
-        writed_sizes[i] = 0;
-//        handler_semaphores[i] = dispatch_semaphore_create(0);
-        
-        char filePath[256] = {0};
-        char fileName[50] = {0};
-        sprintf(fileName, "/map_file_%d.txt", i+1);
-        documentPath(filePath, fileName);
-        fds[i] = open(filePath, O_RDWR | O_CREAT | O_TRUNC, (mode_t)0600);
-        if (fds[i] == - 1) {
-            perror("open");
-        }
+    
+    msgHandler.bt_m = backtraceManagerAlloc();
+    char filePath[256] = {0};
+    char fileName[50] = {0};
+    sprintf(fileName, "/map_file.txt");
+    documentPath(filePath, fileName);
+    msgHandler.fd = open(filePath, O_RDWR | O_CREAT | O_TRUNC, (mode_t)0666);
+    if (msgHandler.fd == - 1) {
+        perror("open");
     }
+    MAP_SIZE = getpagesize();
     xx_dtp_hook_begin();
 }
 
@@ -143,177 +124,142 @@ __attribute__((constructor)) static void xx_hook_entry(void) {
 //程序执行完成,返回将继续执行lr中的函数
 #define ret() __asm volatile ("ret\n");
 void startHandle(void) {
-//    for (int i = 0; i < threadNum; i++) {
-//        dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
-//            handleBacktrace(i);
-//        });
-//    }
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{    
+        handleBacktrace();
+    });
 }
+
 void stopHandle(void) {
     stop_handle = true;
-    for (int i = 0; i < threadNum; i++) {
-//        dispatch_semaphore_signal(handler_semaphores[i]);
+}
+
+void printFile(int fd) {
+    if (fd < 0) {
+        return;
+    }
+    char buffer[BUFFER_SIZE];
+    ssize_t bytesRead = 0;
+    lseek(fd, 0, SEEK_SET);
+    while ((bytesRead = read(fd, buffer, BUFFER_SIZE)) > 0) {
+        if (write(STDOUT_FILENO, buffer, bytesRead) != bytesRead) {
+            perror("write");
+        }
     }
 }
-static void handleBacktrace(int idx) {
-    if (stop_handle || fds[idx] < 0 || map_areas[idx] == MAP_FAILED) return;
-    while (true) {
-//        dispatch_semaphore_wait(handler_semaphores[idx], DISPATCH_TIME_FOREVER);
-        void **current_btp = handle_current_backtrace_p[idx];
-        if (current_btp == NULL) {
-            current_btp = backtrace_pointers[idx];
-            handle_current_backtrace_p[idx] = current_btp;
-        }
-        while ((uintptr_t)current_btp < (uintptr_t)(backtrace_pointers[idx] + backtrace_sizes[idx])) {
-            int frames = 0;
-            while (*current_btp != NULL) {
-                frames++;
-                current_btp++;
-            }
-            char **strs = backtrace_symbols(current_btp, frames);
-            for (int i = 0; i < frames; ++i) {
-                size_t left_size = mapped_sizes[idx];
-                if (left_size < 256) {
-                    if (map_areas[idx]) {
-                        if (munmap(map_areas[idx], MAP_SIZE) == -1) {
-                            perror("munmap");
-                        }
-                    }
-                    map_areas[idx] = mmap(NULL, MAP_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fds[idx], writed_sizes[idx]);
-                    if (map_areas[idx] == MAP_FAILED) {
-                        perror("mmap");
-                        return;
-                    }
-                    size_t total_size = writed_sizes[idx] + MAP_SIZE;
-                    // 将文件大小调整为数据长度
-                    if (lseek(fds[idx], total_size - 1, SEEK_SET) == -1) {
-                        close(fds[idx]);
-                        perror("Error calling lseek() to 'stretch' the file");
-                        return;
-                    }
-                    // 写入一个空字节，确保文件大小达到指定大小
-                    if (write(fds[idx], "", 1) == -1) {
-                        close(fds[idx]);
-                        perror("Error writing last byte of the file");
-                        return;
-                    }
-                    mapped_sizes[idx] = MAP_SIZE;
+static void copyStrToMapArea(const char *str) {
+    while (*str != '\0') {
+        if (msgHandler.mapped_size <= 0) {
+            if (msgHandler.map_area) {
+                if (munmap(msgHandler.map_area, MAP_SIZE) == -1) {
+                    perror("munmap");
+                    return;
                 }
-                char *map_p = map_areas[idx];
-                char *to_write = map_p + (MAP_SIZE - mapped_sizes[idx]);
-                int size = sprintf(to_write, "%s\n", strs[i]);
-                writed_sizes[idx] += size;
-                mapped_sizes[idx] -= size;
             }
-            current_btp++;
-            handle_current_backtrace_p[idx] = current_btp;
+            size_t total_size = msgHandler.writed_size + MAP_SIZE;
+            // 将文件大小调整为数据长度
+            if (lseek(msgHandler.fd, total_size-1, SEEK_SET) == -1) {
+                perror("Error calling lseek() to 'stretch' the file");
+                return;
+            } else {
+                printf("file size:%ld Byte\n", total_size);
+            }
+            // 写入一个空字节，确保文件大小达到指定大小
+            if (write(msgHandler.fd, "", 1) == -1) {
+                perror("Error writing last byte of the file\n");
+                return;;
+            }
+            msgHandler.map_area = mmap(NULL, MAP_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED|MAP_FILE, msgHandler.fd, msgHandler.writed_size);
+            if (msgHandler.map_area == MAP_FAILED) {
+                perror("mmap");
+                printf("errorn:%d", errno);
+                return;;
+            }
+            msgHandler.mapped_size = MAP_SIZE;
         }
-//        printf("handle idx = %d\n", idx);
-        if (stop_handle) {
-            return;
-        }
-        sleep(1);
+        char *to_write = msgHandler.map_area + (MAP_SIZE - msgHandler.mapped_size);
+        *to_write = *str;
+        str++;
+        msgHandler.mapped_size--;
+        msgHandler.writed_size++;
     }
+}
+static void handleBacktrace() {
+    if (stop_handle || msgHandler.fd < 0 || msgHandler.map_area == MAP_FAILED) return;
+    while (true) {
+        backtrace_s_link *node = getStoreToRead(msgHandler.bt_m);
+        if (node != NULL) {
+            char **strs = backtrace_symbols(node->store->btrace, node->store->frames);
+            placeToWriteLink(msgHandler.bt_m, node);
+            if (node->store->currentModuleName) {
+                copyStrToMapArea(node->store->currentModuleName);
+                copyStrToMapArea(":");
+            }
+            if (node->store->currentMethodName) {
+                copyStrToMapArea(node->store->currentMethodName);
+                copyStrToMapArea("\n");
+            }
+            for (int i = 0; i < node->store->frames; ++i) {
+                copyStrToMapArea(strs[i]);
+                copyStrToMapArea("\n");
+            }
+            copyStrToMapArea("|\n");
+        } else {
+            printf("no node to handle\n");
+            struct stat file_stat;
+            if (fstat(msgHandler.fd, &file_stat) == -1) {
+                perror("Error getting file size\n");
+                goto done;
+            }
+            printf("map file size:%lld, map offset: %ld, page size:%d, has_writed:%ld, has_read:%ld, left_to_read:%ld, total_nodes:%ld\n", file_stat.st_size, msgHandler.writed_size, getpagesize(), msgHandler.bt_m->has_writed, msgHandler.bt_m->has_read, msgHandler.bt_m->has_writed - msgHandler.bt_m->has_read, msgHandler.bt_m->total_nodes);
+            sleep(1);
+        }
+        if (stop_handle) {
+            goto done;
+        }
+    }
+done:
+    if (msgHandler.fd != -1) {
+        close(msgHandler.fd);
+    }
+    if (msgHandler.map_area != MAP_FAILED && munmap(msgHandler.map_area, MAP_SIZE) == -1) {
+        perror("munmap");
+    }
+    backtraceManagerDestory(&msgHandler.bt_m);
 }
 
 void printFileContent(void) {
-#define BUFFER_SIZE 1024
-    for (int i = 0; i < threadNum; i++) {
-        printf("print map_file_%d.txt\n", i+1);
-        char buffer[BUFFER_SIZE];
-        ssize_t bytesRead = 0;
-        lseek(fds[i], 0, SEEK_SET);
-        while ((bytesRead = read(fds[i], buffer, BUFFER_SIZE)) > 0) {
-            if (write(STDOUT_FILENO, buffer, bytesRead) != bytesRead) {
-                perror("write");
-            }
-        }
+
+    char filePath[256] = {0};
+    char fileName[50] = {0};
+    sprintf(fileName, "/map_file.txt");
+    documentPath(filePath, fileName);
+    int fd = open(filePath, O_RDWR, (mode_t)0600);
+    if (fd == - 1) {
+        perror("open");
     }
+    printf("print map_file.txt\n");
+    printFile(fd);
+    close(fd);
 }
 
 void xx_before_objc_msgSend(id self, SEL _cmd) {
     if(stop_handle || strstr(sel_getName(_cmd), "dealloc") || strstr(sel_getName(_cmd), "_xref_dispose")) return;
     Class _cls = object_getClass(self);
     const char *imageName = class_getImageName(_cls);
-    //char *moduleName = basename((char *)imageName);
-    if(imageName && strstr(imageName, "ocdemo") == NULL) {
-        os_unfair_lock_lock(&globalLock);
-        int idx = method_count % threadNum;
-//        void **current_btp = current_backtrace_p[idx];
-//        if (current_btp == NULL) {
-//            void *btp = calloc(4096, sizeof(void *));
-//            if (btp) {
-//                current_btp = btp;
-//                backtrace_pointers[idx] = btp;
-//                current_backtrace_p[idx] = btp;
-//                backtrace_sizes[idx] = 4096;
-//                backtrace_left_sizes[idx] = 4096;
-//            }
-//        }
-//        int left_size = backtrace_left_sizes[idx];
-//        if (left_size < 128) {
-//            void **p = backtrace_pointers[idx];
-//            p = realloc(p, backtrace_sizes[idx]+4096);
-//            if(p != backtrace_pointers[idx]) {
-//                current_backtrace_p[idx] = p + ((uintptr_t)current_btp - (uintptr_t)backtrace_pointers[idx]);
-//                current_btp = current_backtrace_p[idx];
-//            }
-//            if (p) {
-//                backtrace_pointers[idx] = p;
-//                backtrace_sizes[idx] += 4096;
-//                left_size += 4096;
-//                backtrace_left_sizes[idx] = left_size;
-//            } else {
-//                printf("error");
-//            }
-//        }
-        void **current_btp = calloc(128, sizeof(void*));
-        int frames = backtrace(current_btp, 128);
-        free(current_btp);
-//        frames++;
-//        *(current_btp + frames) = NULL;
-//        current_backtrace_p[idx] = current_btp + frames;
-//        backtrace_left_sizes[idx] = left_size - frames;
-        method_count++;
-//        dispatch_semaphore_signal(handler_semaphores[idx]);
-        os_unfair_lock_unlock(&globalLock);
-        
-//        char **strs = backtrace_symbols(callstack, frames);
-//        for (int i = 0; i < frames; ++i) {
-//            size_t len = strlen(strs[i]) + 1; // 1为\n
-//            size_t left_size = mapped_size - len;
-//            if (left_size < 0) {
-//                map_area = mmap(NULL, MAP_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, writed_size);
-//                if (map_area == MAP_FAILED) {
-//                    perror("mmap");
-//                }
-//                mapped_size = MAP_SIZE;
-//            }
-//            vsprintf(map_area, "%s\n", strs[i]);
-////            printf("%s\n", strs[i]);
-//            const char *left = strstr(strs[i], "[");
-//            if(left) {
-//                left++;
-//                const char *right = strstr(left, " ");
-//                if(right) {
-//                    size_t len = (uintptr_t)right - (uintptr_t)left;
-//                    char *className = malloc(len+1);
-//                    className[len] = '\0';
-//                    strncpy(className, left, len);
-//                    Class c = objc_getClass(className);
-//                    if(c) {
-//                        const char *imagePath = class_getImageName(c);
-//                        if(imagePath && strstr(imagePath, "ocdemo")) {
-//                            printf("[mtrace]: %s -> [%s %s]\n", moduleName, class_getName(_cls), sel_getName(_cmd));
-//                            break;
-//                        }
-//                    }
-//                }
-//            }
-//        }
-//        free(strs);
-//        printf("[mtrace]: [%s %s]\n", class_getName(_cls), sel_getName(_cmd));
-    }
+    char *currentModuleName = basename((char *)imageName);
+//    if(imageName && strstr(imageName, "ocdemo") == NULL) {
+    os_unfair_lock_lock(&globalLock);
+    backtrace_s_link *node = getStoreToWrite(msgHandler.bt_m);
+    node->store->currentModuleName = (char *)calloc(strlen(currentModuleName)+1, sizeof(char));
+    sprintf(node->store->currentModuleName, "%s", currentModuleName);
+    char methodName[256] = {0};
+    int len = sprintf(methodName, "%s[%s %s]", class_isMetaClass(_cls) ? "+" : "-", class_getName(_cls), sel_getName(_cmd));
+    node->store->currentMethodName = (char *)calloc(len+1, sizeof(char));
+    strcpy(node->store->currentMethodName, methodName);
+    node->store->frames = backtrace(node->store->btrace, node->store->frames);
+    placeToReadLink(msgHandler.bt_m, node);
+    os_unfair_lock_unlock(&globalLock);
+//    }
 }
 
 /**
